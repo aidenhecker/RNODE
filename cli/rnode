@@ -148,6 +148,24 @@ def restart_meshchat():
     print("meshchat: " + ("restarted, radio reloaded ✓" if ok else "restart FAILED — check logs"))
 
 
+def banner():
+    red, bold, off = "\033[91m", "\033[1m", "\033[0m"
+    if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
+        red = bold = off = ""
+    rows = [
+        ("██████╗ ", "███╗   ██╗ ██████╗ ██████╗ ███████╗"),
+        ("██╔══██╗", "████╗  ██║██╔═══██╗██╔══██╗██╔════╝"),
+        ("██████╔╝", "██╔██╗ ██║██║   ██║██║  ██║█████╗  "),
+        ("██╔══██╗", "██║╚██╗██║██║   ██║██║  ██║██╔══╝  "),
+        ("██║  ██║", "██║ ╚████║╚██████╔╝██████╔╝███████╗"),
+        ("╚═╝  ╚═╝", "╚═╝  ╚═══╝ ╚═════╝ ╚═════╝ ╚══════╝"),
+    ]
+    print()
+    for r_part, node_part in rows:
+        print(f"  {red}{r_part}{off}{bold}{node_part}{off}")
+    print(f"\n  {bold}Reticulum LoRa station{off} · rnode help for commands\n")
+
+
 # -- commands ----------------------------------------------------------------
 
 def cmd_status():
@@ -227,6 +245,7 @@ def cmd_web():
 
 
 def cmd_run():
+    banner()
     started = False
     for name in DAEMONS:
         if not running(name):
@@ -371,6 +390,7 @@ def cmd_ai(args):
 def main():
     args = sys.argv[1:]
     if not args or args[0] in ("-h", "--help", "help"):
+        banner()
         print(__doc__)
         return
     cmd, rest = args[0], args[1:]
