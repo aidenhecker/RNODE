@@ -1,0 +1,26 @@
+[project]
+name = "meshtastic-lxmf-bridge"
+version = "0.1.0"
+description = "Bidirectional bridge between a Meshtastic mesh and Reticulum LXMF — DMs and reverse flow included"
+requires-python = ">=3.12"
+dependencies = [
+    "meshtastic>=2.5.0",
+    "rns>=1.0.0",
+    "lxmf>=0.6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+mlx-bridge = "bridge.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["bridge"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.log
+.venv/
+storage/
+outbox/
+config.toml
+owner.txt
+STATION.md
+setup/meshtastic-backup.yaml

@@ -1,0 +1,29 @@
+# Reticulum config — Heltec V4 RNode (flashed 2026-07-27, fw 1.86)
+[reticulum]
+  enable_transport = False
+  share_instance = Yes
+  shared_instance_port = 37428
+  instance_control_port = 37429
+  panic_on_interface_error = No
+
+[logging]
+  loglevel = 4
+
+[interfaces]
+  # LAN peering (Mac <-> other RNS instances on the same network)
+  [[Default Interface]]
+    type = AutoInterface
+    enabled = yes
+    devices = en0
+
+  # Heltec V4 RNode over USB serial
+  # US 915 ISM band; txpower kept moderate (PA max is 28 dBm)
+  [[RNode LoRa]]
+    type = RNodeInterface
+    enabled = yes
+    port = /dev/cu.usbmodem1101
+    frequency = 914875000
+    bandwidth = 125000
+    txpower = 17
+    spreadingfactor = 8
+    codingrate = 5

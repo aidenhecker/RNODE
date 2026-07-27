@@ -1,0 +1,407 @@
+#!/usr/bin/env python3
+"""rnode — control the Heltec V4 Reticulum station from one command.
+
+  rnode run                 start everything + open the chat in your browser
+  rnode status              station overview (daemons, radio, port)
+  rnode up | down           start / stop meshchat + bridge + claude-peer
+  rnode radio               show current radio params
+  rnode set <key> <value>   set frequency|bandwidth|spreadingfactor|codingrate|txpower
+  rnode power <dBm>         shortcut for txpower (0-28)
+  rnode preset <name>       fast | balanced | longrange | maxrange
+  rnode device [args...]    run rnodeconf against the board (pauses MeshChat)
+  rnode web                 open the MeshChat UI + print LAN URL
+  rnode logs [name]         tail a log: meshchat | bridge | peer  (default: all)
+  rnode ai [question]       AI link copilot (OpenRouter) — tunes your radio with you
+  rnode ai setup            store your OpenRouter API key
+
+Env overrides: RNODE_RETICULUM_CONFIG, RNODE_PORT, RNODE_MESHCHAT_DIR,
+RNODE_AI_MODEL (default anthropic/claude-sonnet-5).
+"""
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+HOME = Path.home()
+RETICULUM_CONFIG = Path(os.environ.get("RNODE_RETICULUM_CONFIG",
+                                       HOME / ".reticulum" / "config"))
+RNODE_DIR = Path(__file__).resolve().parent.parent
+MESHCHAT_DIR = Path(os.environ.get("RNODE_MESHCHAT_DIR",
+                                   RNODE_DIR.parent / "reticulum-meshchat"))
+BRIDGE_DIR = RNODE_DIR / "meshtastic-lxmf-bridge"
+PEER_DIR = RNODE_DIR / "claude-peer"
+MESHCHAT_LOG = Path(os.environ.get("RNODE_MESHCHAT_LOG",
+                                   HOME / "Production/Agent-Outputs/heltec-v4/meshchat.log"))
+RNODECONF = HOME / ".local/bin/rnodeconf"
+CONFIG_DIR = HOME / ".config" / "rnode"
+AI_KEY_FILE = CONFIG_DIR / "openrouter_key"
+AI_MODEL = os.environ.get("RNODE_AI_MODEL", "anthropic/claude-sonnet-5")
+
+RADIO_KEYS = ("frequency", "bandwidth", "spreadingfactor", "codingrate", "txpower")
+
+PRESETS = {
+    # name: (bandwidth, spreadingfactor, codingrate, ~speed, blurb)
+    "fast":      (250000, 7,  5, "~11 kbps",  "short range, snappy"),
+    "balanced":  (125000, 8,  5, "~3.1 kbps", "the default we shipped"),
+    "longrange": (125000, 10, 5, "~980 bps",  "2x-ish range, still fine for chat"),
+    "maxrange":  (125000, 12, 7, "~180 bps",  "every last dB, texts take seconds"),
+}
+
+DAEMONS = {
+    "meshchat": {
+        "pattern": "meshchat.py",
+        "cwd": MESHCHAT_DIR,
+        "argv": [".venv/bin/python", "meshchat.py", "--headless",
+                 "--host", "0.0.0.0", "--port", "8000"],
+        "log": MESHCHAT_LOG,
+    },
+    "bridge": {
+        "pattern": "python -m bridge",
+        "cwd": BRIDGE_DIR,
+        "argv": [".venv/bin/python", "-m", "bridge", "-c", "config.toml"],
+        "log": BRIDGE_DIR / "bridge.log",
+    },
+    "peer": {
+        "pattern": "claude_peer.py",
+        "cwd": PEER_DIR,
+        "argv": [str(BRIDGE_DIR / ".venv/bin/python"), "claude_peer.py"],
+        "log": PEER_DIR / "peer.log",
+    },
+}
+
+
+def sh(cmd, **kw):
+    return subprocess.run(cmd, shell=True, text=True, capture_output=True, **kw)
+
+
+def start_daemon(name):
+    d = DAEMONS[name]
+    Path(d["log"]).parent.mkdir(parents=True, exist_ok=True)
+    log = open(d["log"], "a")
+    subprocess.Popen(d["argv"], cwd=d["cwd"], stdout=log, stderr=subprocess.STDOUT,
+                     stdin=subprocess.DEVNULL, start_new_session=True)
+
+
+def running(name):
+    return sh(f"pgrep -f '{DAEMONS[name]['pattern']}'").returncode == 0
+
+
+def serial_port():
+    if os.environ.get("RNODE_PORT"):
+        return os.environ["RNODE_PORT"]
+    ports = sorted(glob.glob("/dev/cu.usbmodem*"))
+    return ports[0] if ports else None
+
+
+def lan_ip():
+    for iface in ("en0", "en1"):
+        r = sh(f"ipconfig getifaddr {iface}")
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    return "?"
+
+
+# -- config editing ----------------------------------------------------------
+
+def read_radio_params():
+    text = RETICULUM_CONFIG.read_text()
+    block = radio_block(text)
+    params = {}
+    for key in RADIO_KEYS:
+        m = re.search(rf"^\s*{key}\s*=\s*(\S+)", block, re.M)
+        if m:
+            params[key] = m.group(1)
+    return params
+
+
+def radio_block(text):
+    m = re.search(r"(\[\[RNode LoRa\]\].*?)(?=^\s*\[\[|\Z)", text, re.S | re.M)
+    if not m:
+        sys.exit("no [[RNode LoRa]] section in " + str(RETICULUM_CONFIG))
+    return m.group(1)
+
+
+def set_radio_params(changes: dict):
+    text = RETICULUM_CONFIG.read_text()
+    block = radio_block(text)
+    new_block = block
+    for key, value in changes.items():
+        new_block, n = re.subn(rf"^(\s*{key}\s*=\s*)\S+", rf"\g<1>{value}",
+                               new_block, count=1, flags=re.M)
+        if n == 0:
+            sys.exit(f"key '{key}' not found in [[RNode LoRa]] section")
+    RETICULUM_CONFIG.write_text(text.replace(block, new_block))
+
+
+def restart_meshchat():
+    if running("meshchat"):
+        sh(f"pkill -f '{DAEMONS['meshchat']['pattern']}'")
+        time.sleep(2)
+    start_daemon("meshchat")
+    time.sleep(6)
+    ok = sh("curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000").stdout == "200"
+    print("meshchat: " + ("restarted, radio reloaded ✓" if ok else "restart FAILED — check logs"))
+
+
+# -- commands ----------------------------------------------------------------
+
+def cmd_status():
+    port = serial_port()
+    print(f"port      : {port or 'NOT CONNECTED'}")
+    for name in DAEMONS:
+        state = "up" if running(name) else "down"
+        print(f"{name:<10}: {state}")
+    if running("meshchat"):
+        print(f"web ui    : http://localhost:8000  (LAN http://{lan_ip()}:8000)")
+    print("radio     : " + "  ".join(f"{k}={v}" for k, v in read_radio_params().items()))
+
+
+def cmd_up():
+    for name in DAEMONS:
+        if running(name):
+            print(f"{name}: already up")
+        else:
+            start_daemon(name)
+            print(f"{name}: started")
+    time.sleep(5)
+    cmd_status()
+
+
+def cmd_down():
+    for name in DAEMONS:
+        sh(f"pkill -f '{DAEMONS[name]['pattern']}'")
+        print(f"{name}: stopped")
+
+
+def cmd_radio():
+    for k, v in read_radio_params().items():
+        print(f"{k:<16}= {v}")
+
+
+def cmd_set(key, value):
+    if key not in RADIO_KEYS:
+        sys.exit(f"key must be one of: {', '.join(RADIO_KEYS)}")
+    if key == "txpower" and not 0 <= int(value) <= 28:
+        sys.exit("txpower must be 0-28 dBm (PA hardware limit)")
+    if key == "txpower" and int(value) > 17:
+        print(f"note: >{17} dBm runs the PA hot; watch CPU temp in rnstatus")
+    set_radio_params({key: value})
+    print(f"{key} = {value}")
+    restart_meshchat()
+
+
+def cmd_preset(name):
+    if name not in PRESETS:
+        sys.exit("presets: " + ", ".join(PRESETS))
+    bw, sf, cr, speed, blurb = PRESETS[name]
+    set_radio_params({"bandwidth": bw, "spreadingfactor": sf, "codingrate": cr})
+    print(f"preset '{name}': bw={bw} sf={sf} cr={cr}  ({speed} — {blurb})")
+    print("⚠ every node on your network must match these params")
+    restart_meshchat()
+
+
+def cmd_device(args):
+    port = serial_port()
+    if not port:
+        sys.exit("no serial port found — is the board plugged in?")
+    was_up = running("meshchat")
+    if was_up:
+        print("pausing meshchat (it owns the serial port)...")
+        sh(f"pkill -f '{DAEMONS['meshchat']['pattern']}'")
+        time.sleep(2)
+    try:
+        subprocess.run([str(RNODECONF), port] + args)
+    finally:
+        if was_up:
+            restart_meshchat()
+
+
+def cmd_web():
+    print(f"local: http://localhost:8000   LAN: http://{lan_ip()}:8000")
+    sh("open http://localhost:8000")
+
+
+def cmd_run():
+    started = False
+    for name in DAEMONS:
+        if not running(name):
+            start_daemon(name)
+            print(f"{name}: started")
+            started = True
+    for _ in range(20 if started else 3):
+        if sh("curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000").stdout == "200":
+            break
+        time.sleep(1)
+    else:
+        sys.exit("web ui didn't come up — try `rnode logs meshchat`")
+    cmd_web()
+
+
+def cmd_logs(which=None):
+    names = [which] if which else list(DAEMONS)
+    for name in names:
+        log = DAEMONS[name]["log"]
+        print(f"===== {name} ({log}) =====")
+        print(sh(f"tail -8 {log}").stdout)
+
+
+# -- AI copilot ---------------------------------------------------------------
+
+AI_SYSTEM = """You are the link copilot inside `rnode`, a CLI controlling a
+Reticulum RNode LoRa station (Heltec V4, SX1262, 902-928 MHz US ISM, PA up to
+28 dBm). You help the operator get their optimal connection: range vs speed
+trade-offs, spreading factor / bandwidth / coding rate / txpower, antenna and
+placement advice, noise-floor and airtime interpretation, and FCC EIRP limits
+(36 dBm EIRP cap; >6 dBi antenna gain requires backing off TX power dB-for-dB).
+
+You will receive the station's live status each turn. Radio changes must match
+on EVERY node in the operator's network — always remind them when you change
+modulation params (frequency/bandwidth/spreadingfactor/codingrate). txpower is
+per-node and safe to tune freely.
+
+To change settings, put each action on its own line, exactly:
+APPLY: set <frequency|bandwidth|spreadingfactor|codingrate|txpower> <value>
+APPLY: preset <fast|balanced|longrange|maxrange>
+The CLI asks the operator to confirm before applying. Keep answers short and
+practical, like a good radio tech."""
+
+
+def ai_key():
+    if os.environ.get("OPENROUTER_API_KEY"):
+        return os.environ["OPENROUTER_API_KEY"]
+    if AI_KEY_FILE.exists():
+        return AI_KEY_FILE.read_text().strip()
+    sys.exit("no OpenRouter key — run `rnode ai setup` (get a key at openrouter.ai/keys)")
+
+
+def ai_setup():
+    import getpass
+    key = getpass.getpass("OpenRouter API key (input hidden): ").strip()
+    if not key.startswith("sk-or-"):
+        print("warning: that doesn't look like an OpenRouter key (sk-or-...)")
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    AI_KEY_FILE.write_text(key + "\n")
+    AI_KEY_FILE.chmod(0o600)
+    print(f"saved to {AI_KEY_FILE} (0600). Model: {AI_MODEL} (override: RNODE_AI_MODEL)")
+
+
+def ai_call(messages, key):
+    req = urllib.request.Request(
+        "https://openrouter.ai/api/v1/chat/completions",
+        data=json.dumps({"model": AI_MODEL, "messages": messages}).encode(),
+        headers={"Authorization": f"Bearer {key}",
+                 "Content-Type": "application/json",
+                 "X-Title": "rnode-cli"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            return json.loads(r.read())["choices"][0]["message"]["content"]
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")[:300]
+        sys.exit(f"OpenRouter error {e.code}: {body}")
+
+
+def station_snapshot():
+    radio = "  ".join(f"{k}={v}" for k, v in read_radio_params().items())
+    rnst = sh(str(HOME / ".local/bin/rnstatus")).stdout[-1600:]
+    daemons = ", ".join(f"{n}={'up' if running(n) else 'down'}" for n in DAEMONS)
+    return f"RADIO PARAMS: {radio}\nDAEMONS: {daemons}\nRNSTATUS:\n{rnst}"
+
+
+def ai_apply(line):
+    parts = line.split()
+    try:
+        if parts[0] == "set" and len(parts) == 3:
+            cmd_set(parts[1], parts[2])
+        elif parts[0] == "preset" and len(parts) == 2:
+            cmd_preset(parts[1])
+        else:
+            print(f"unrecognized action: {line}")
+            return f"action not recognized: {line}"
+        return f"applied: {line}"
+    except SystemExit as e:
+        print(e)
+        return f"rejected: {e}"
+
+
+def cmd_ai(args):
+    if args and args[0] == "setup":
+        return ai_setup()
+    key = ai_key()
+    messages = [{"role": "system", "content": AI_SYSTEM}]
+    pending = " ".join(args) if args else input("you> ").strip()
+    print(f"(model: {AI_MODEL} — 'q' to quit)")
+    while True:
+        if not pending or pending.lower() in ("q", "quit", "exit"):
+            break
+        messages.append({"role": "user",
+                         "content": f"{station_snapshot()}\n\nOPERATOR: {pending}"})
+        reply = ai_call(messages, key)
+        messages.append({"role": "assistant", "content": reply})
+        results = []
+        shown = []
+        for line in reply.splitlines():
+            m = re.match(r"^\s*APPLY:\s*(.+)$", line)
+            if m:
+                action = m.group(1).strip()
+                if input(f"apply '{action}'? [y/N] ").strip().lower() == "y":
+                    results.append(ai_apply(action))
+                else:
+                    results.append(f"operator declined: {action}")
+            else:
+                shown.append(line)
+        print("\n".join(shown).strip())
+        if results:
+            messages.append({"role": "user",
+                             "content": "RESULTS: " + "; ".join(results)})
+            reply = ai_call(messages, key)
+            messages.append({"role": "assistant", "content": reply})
+            print(re.sub(r"^\s*APPLY:.*$", "", reply, flags=re.M).strip())
+        try:
+            pending = input("\nyou> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+    cmd, rest = args[0], args[1:]
+    if cmd == "status":
+        cmd_status()
+    elif cmd == "run":
+        cmd_run()
+    elif cmd == "ai":
+        cmd_ai(rest)
+    elif cmd == "up":
+        cmd_up()
+    elif cmd == "down":
+        cmd_down()
+    elif cmd == "radio":
+        cmd_radio()
+    elif cmd == "set" and len(rest) == 2:
+        cmd_set(rest[0], rest[1])
+    elif cmd == "power" and len(rest) == 1:
+        cmd_set("txpower", rest[0])
+    elif cmd == "preset" and len(rest) == 1:
+        cmd_preset(rest[0])
+    elif cmd == "device":
+        cmd_device(rest)
+    elif cmd == "web":
+        cmd_web()
+    elif cmd == "logs":
+        cmd_logs(rest[0] if rest else None)
+    else:
+        print(__doc__)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

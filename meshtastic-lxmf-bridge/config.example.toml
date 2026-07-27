@@ -1,0 +1,14 @@
+# Copy to config.toml and edit.
+
+[meshtastic]
+# "serial" for a USB-attached Meshtastic node, "tcp" for meshtasticd / WiFi node
+connection = "serial"
+port = "/dev/cu.usbmodem2101"
+# host = "192.168.1.60"        # used when connection = "tcp"
+
+[lxmf]
+# Your LXMF address (Sideband/MeshChat: copy your address hash, hex only, no <>)
+owner_address = "put-your-lxmf-address-hash-here"
+display_name = "MTX Bridge"
+announce_interval = 1800
+storage_dir = "storage"
