@@ -34,6 +34,12 @@ rnode device --info
   [reticulum-meshchat](https://github.com/liamcottle/reticulum-meshchat)
   cloned as a sibling directory (or set `RNODE_MESHCHAT_DIR`)
 
+## Flash your board
+
+See **[FLASHING.md](FLASHING.md)** — `rnodeconf --autoinstall` covers 16 board
+types (Heltec V2-V4/T114, LilyGO T3/T-Beam/T-Echo/T-Deck/T3S3, RAK4631,
+XIAO ESP32S3, homebrew), plus the web-flasher route and the gotchas.
+
 ## Install
 
 ```bash
