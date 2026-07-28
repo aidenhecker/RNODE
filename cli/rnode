@@ -11,6 +11,10 @@
   rnode device [args...]    run rnodeconf against the board (pauses MeshChat)
   rnode web                 open the MeshChat UI + print LAN URL
   rnode logs [name]         tail a log: meshchat | bridge | peer  (default: all)
+  rnode doctor [--fix]      diagnose the station; --fix applies safe remedies
+  rnode log start [min]     open the RF blackhole: sample radio+BLE+WiFi (default 10m)
+  rnode log stop|status     manage the sampler
+  rnode log analyze [--ai]  micro harmonic-sequencing over the blackhole log
   rnode ai [question]       AI link copilot (OpenRouter) — tunes your radio with you
   rnode ai setup            store your OpenRouter API key
 
@@ -269,6 +273,150 @@ def cmd_logs(which=None):
         print(sh(f"tail -8 {log}").stdout)
 
 
+RNODE_LOGD = RNODE_DIR / "cli" / "rnode_logd.py"
+RFLOG = Path(os.environ.get("RNODE_RFLOG",
+                            HOME / "Production/Agent-Outputs/heltec-v4/rflog.jsonl"))
+
+
+def set_config_port(new_port):
+    text = RETICULUM_CONFIG.read_text()
+    block = radio_block(text)
+    new_block, n = re.subn(r"^(\s*port\s*=\s*)\S+", rf"\g<1>{new_port}",
+                           block, count=1, flags=re.M)
+    if n:
+        RETICULUM_CONFIG.write_text(text.replace(block, new_block))
+    return bool(n)
+
+
+def cmd_doctor(fix=False):
+    findings, remedies = [], []
+
+    ports = sorted(glob.glob("/dev/cu.usbmodem*"))
+    conf_port = read_radio_params_port()
+    if not ports:
+        findings.append(("FAIL", "no usbmodem port — board unplugged, or USB wedged"))
+        remedies.append("replug the board or press RST; if it stays gone, different cable/port")
+    else:
+        findings.append(("OK", f"port(s): {', '.join(ports)}"))
+
+    if ports and conf_port not in ports:
+        findings.append(("FAIL", f"config points at {conf_port} but board is at {ports[0]} (port moved)"))
+        if fix:
+            set_config_port(ports[0])
+            sh(f"pkill -f '{DAEMONS['meshchat']['pattern']}'"); time.sleep(2)
+            start_daemon("meshchat"); time.sleep(6)
+            findings.append(("FIXED", f"config -> {ports[0]}, meshchat restarted"))
+        else:
+            remedies.append(f"rnode doctor --fix  (rewrites port to {ports[0]} + restarts meshchat)")
+    elif conf_port:
+        findings.append(("OK", f"config port matches: {conf_port}"))
+
+    for name in DAEMONS:
+        if running(name):
+            findings.append(("OK", f"{name} up"))
+        else:
+            findings.append(("WARN", f"{name} down"))
+            if fix:
+                start_daemon(name)
+                findings.append(("FIXED", f"{name} started"))
+            else:
+                remedies.append(f"rnode up  (starts {name})")
+
+    try:
+        rnst = subprocess.run([str(HOME / ".local/bin/rnstatus")], text=True,
+                              capture_output=True, timeout=12).stdout
+    except (subprocess.TimeoutExpired, OSError):
+        rnst = ""
+    if "Shared Instance" in rnst:
+        findings.append(("OK", "reticulum shared instance up"))
+    else:
+        findings.append(("WARN", "no shared instance reachable"))
+    chunk = next((c for c in rnst.split("\n\n") if "RNodeInterface" in c), "")
+    if "Status    : Up" in chunk:
+        m = re.search(r"Noise Fl\.\s*:\s*(-?\d+)\s*dBm", chunk)
+        t = re.search(r"CPU temp\s*:\s*(\d+)", chunk)
+        findings.append(("OK", "RNodeInterface up"
+                         + (f", noise {m.group(1)} dBm" if m else "")
+                         + (f", {t.group(1)}°C" if t else "")))
+        if t and int(t.group(1)) >= 70:
+            findings.append(("WARN", f"PA running hot ({t.group(1)}°C) — consider lower txpower"))
+    else:
+        findings.append(("FAIL", "RNodeInterface down"))
+        port = ports[0] if ports else None
+        holder = sh(f"lsof {port} 2>/dev/null | tail -n +2").stdout.strip() if port else ""
+        if port and not holder:
+            probe = sh(f"timeout_ok=1; {HOME}/.local/bin/rnodeconf {port} --info 2>&1 | tail -2")
+            if "Firmware version" in probe.stdout or "Device signature" in probe.stdout:
+                remedies.append("device answers — restart meshchat: rnode up")
+            else:
+                findings.append(("FAIL", "device not responding on serial"))
+                remedies.append("press RST on the board (chip likely hung); then rnode doctor --fix")
+
+    bond = sh("blueutil --paired 2>/dev/null | grep -i 'omni_f710'").stdout.strip()
+    if bond:
+        findings.append(("WARN", "stale 'omni_f710' Bluetooth bond still paired — forget it in System Settings"))
+
+    for level, msg in findings:
+        icon = {"OK": "✓", "WARN": "⚠", "FAIL": "✗", "FIXED": "🔧"}[level]
+        print(f" {icon} {msg}")
+    if remedies and not fix:
+        print("\nprescriptions:")
+        for r in remedies:
+            print(f"   → {r}")
+    if not any(l == "FAIL" for l, _ in findings):
+        print("\nstation healthy 📡")
+
+
+def read_radio_params_port():
+    m = re.search(r"^\s*port\s*=\s*(\S+)", radio_block(RETICULUM_CONFIG.read_text()), re.M)
+    return m.group(1) if m else None
+
+
+def cmd_log(args):
+    sub = args[0] if args else "status"
+    if sub == "start":
+        minutes = float(args[1]) if len(args) > 1 else 10
+        if sh("pgrep -f rnode_logd").returncode == 0:
+            sys.exit("sampler already running — rnode log stop first")
+        RFLOG.parent.mkdir(parents=True, exist_ok=True)
+        log = open(RFLOG.parent / "rnode_logd.out", "a")
+        subprocess.Popen(["python3", str(RNODE_LOGD), "sample", str(minutes), str(RFLOG)],
+                         stdout=log, stderr=subprocess.STDOUT,
+                         stdin=subprocess.DEVNULL, start_new_session=True)
+        print(f"blackhole open: sampling radio+BLE+WiFi for {minutes} min -> {RFLOG}")
+    elif sub == "stop":
+        sh("pkill -f rnode_logd")
+        print("sampler stopped")
+    elif sub == "status":
+        alive = sh("pgrep -f rnode_logd").returncode == 0
+        lines = sum(1 for _ in open(RFLOG)) if RFLOG.exists() else 0
+        print(f"sampler: {'running' if alive else 'stopped'}   samples logged: {lines}")
+    elif sub == "analyze":
+        if "--ai" in args:
+            rep = sh(f"python3 {RNODE_LOGD} analyze {RFLOG} --json").stdout.strip()
+            if not rep:
+                sys.exit("no log data to analyze — rnode log start first")
+            key = ai_key()
+            messages = [
+                {"role": "system", "content":
+                 "You are the RF analyst inside the rnode CLI. You receive a "
+                 "blackhole log report from a LoRa station (noise-floor symbol "
+                 "stream S/U/D/R on 2dB quanta, motifs, anomalies, BLE and WiFi "
+                 "population). Apply the harmonic-sequencing method at micro "
+                 "level: read the symbol stream like a contour, interpret "
+                 "recurring motifs as environmental signatures (appliances, "
+                 "duty-cycled transmitters, interference), flag anything "
+                 "anomalous, and give the operator 2-3 concrete takeaways. "
+                 "Be honest about uncertainty — never invent sources."},
+                {"role": "user", "content": rep},
+            ]
+            print(ai_call(messages, key))
+        else:
+            subprocess.run(["python3", str(RNODE_LOGD), "analyze", str(RFLOG)])
+    else:
+        sys.exit("usage: rnode log start [min] | stop | status | analyze [--ai]")
+
+
 # -- AI copilot ---------------------------------------------------------------
 
 AI_SYSTEM = """You are the link copilot inside `rnode`, a CLI controlling a
@@ -420,6 +568,10 @@ def main():
         cmd_device(rest)
     elif cmd == "web":
         cmd_web()
+    elif cmd == "doctor":
+        cmd_doctor(fix="--fix" in rest)
+    elif cmd == "log":
+        cmd_log(rest)
     elif cmd == "logs":
         cmd_logs(rest[0] if rest else None)
     else:
