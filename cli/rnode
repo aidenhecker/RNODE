@@ -375,15 +375,20 @@ def read_radio_params_port():
 def cmd_log(args):
     sub = args[0] if args else "status"
     if sub == "start":
-        minutes = float(args[1]) if len(args) > 1 else 10
+        nums = [a for a in args[1:] if not a.startswith("--")]
+        minutes = float(nums[0]) if nums else 10
+        channels = "all" if "--all" in args else "rf"
         if sh("pgrep -f rnode_logd").returncode == 0:
             sys.exit("sampler already running — rnode log stop first")
         RFLOG.parent.mkdir(parents=True, exist_ok=True)
         log = open(RFLOG.parent / "rnode_logd.out", "a")
-        subprocess.Popen(["python3", str(RNODE_LOGD), "sample", str(minutes), str(RFLOG)],
-                         stdout=log, stderr=subprocess.STDOUT,
+        cmdline = ["python3", str(RNODE_LOGD), "sample", str(minutes), str(RFLOG)]
+        if channels == "all":
+            cmdline.append("all")
+        subprocess.Popen(cmdline, stdout=log, stderr=subprocess.STDOUT,
                          stdin=subprocess.DEVNULL, start_new_session=True)
-        print(f"blackhole open: sampling radio+BLE+WiFi for {minutes} min -> {RFLOG}")
+        what = "LoRa channel" if channels == "rf" else "LoRa + BLE + WiFi"
+        print(f"blackhole open: sampling {what} for {minutes} min -> {RFLOG}")
     elif sub == "stop":
         sh("pkill -f rnode_logd")
         print("sampler stopped")

@@ -108,20 +108,21 @@ def sample_wifi():
         return {"kind": "wifi", "error": str(e)[:80]}
 
 
-def run_sampler(minutes: float, outfile: Path):
+def run_sampler(minutes: float, outfile: Path, channels: str = "rf"):
+    """channels: 'rf' = LoRa only (default); 'all' = + BLE/WiFi sweeps."""
     outfile.parent.mkdir(parents=True, exist_ok=True)
     deadline = time.time() + minutes * 60
     last_ble = last_wifi = 0.0
     n = 0
     with open(outfile, "a") as f:
         f.write(json.dumps({"kind": "session", "start": time.time(),
-                            "minutes": minutes}) + "\n")
+                            "minutes": minutes, "channels": channels}) + "\n")
         while time.time() < deadline:
             tick = time.time()
             rows = [sample_rf()]
-            if tick - last_ble >= 30:
+            if channels == "all" and tick - last_ble >= 30:
                 rows.append(sample_ble()); last_ble = tick
-            if tick - last_wifi >= 60:
+            if channels == "all" and tick - last_wifi >= 60:
                 rows.append(sample_wifi()); last_wifi = tick
             for r in rows:
                 r["ts"] = round(tick, 2)
@@ -235,7 +236,8 @@ def analyze(outfile: Path, as_json=False):
 if __name__ == "__main__":
     args = sys.argv[1:]
     if args and args[0] == "sample" and len(args) >= 3:
-        run_sampler(float(args[1]), Path(args[2]))
+        run_sampler(float(args[1]), Path(args[2]),
+                    "all" if "all" in args[3:] else "rf")
     elif args and args[0] == "analyze" and len(args) >= 2:
         analyze(Path(args[1]), as_json="--json" in args)
     else:
