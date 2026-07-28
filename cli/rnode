@@ -327,7 +327,11 @@ def ai_call(messages, key):
 
 def station_snapshot():
     radio = "  ".join(f"{k}={v}" for k, v in read_radio_params().items())
-    rnst = sh(str(HOME / ".local/bin/rnstatus")).stdout[-1600:]
+    try:
+        rnst = subprocess.run([str(HOME / ".local/bin/rnstatus")], text=True,
+                              capture_output=True, timeout=12).stdout[-1600:]
+    except (subprocess.TimeoutExpired, OSError) as e:
+        rnst = f"(rnstatus unavailable: {e} — radio params above are from config)"
     daemons = ", ".join(f"{n}={'up' if running(n) else 'down'}" for n in DAEMONS)
     return f"RADIO PARAMS: {radio}\nDAEMONS: {daemons}\nRNSTATUS:\n{rnst}"
 
