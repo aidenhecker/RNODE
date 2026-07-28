@@ -167,6 +167,9 @@ def mine_motifs(toks, lo=2, hi=6, top=8):
 
 
 def analyze(outfile: Path, as_json=False):
+    if not outfile.exists():
+        print("no blackhole log yet — run: rnode log start [minutes]")
+        return
     rows = []
     for line in outfile.read_text().strip().splitlines():
         try:

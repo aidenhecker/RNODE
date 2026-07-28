@@ -378,7 +378,7 @@ def cmd_log(args):
         nums = [a for a in args[1:] if not a.startswith("--")]
         minutes = float(nums[0]) if nums else 10
         channels = "all" if "--all" in args else "rf"
-        if sh("pgrep -f rnode_logd").returncode == 0:
+        if sh("pgrep -f 'rnode_logd.py sample'").returncode == 0:
             sys.exit("sampler already running — rnode log stop first")
         RFLOG.parent.mkdir(parents=True, exist_ok=True)
         log = open(RFLOG.parent / "rnode_logd.out", "a")
@@ -390,10 +390,10 @@ def cmd_log(args):
         what = "LoRa channel" if channels == "rf" else "LoRa + BLE + WiFi"
         print(f"blackhole open: sampling {what} for {minutes} min -> {RFLOG}")
     elif sub == "stop":
-        sh("pkill -f rnode_logd")
+        sh("pkill -f 'rnode_logd.py sample'")
         print("sampler stopped")
     elif sub == "status":
-        alive = sh("pgrep -f rnode_logd").returncode == 0
+        alive = sh("pgrep -f 'rnode_logd.py sample'").returncode == 0
         lines = sum(1 for _ in open(RFLOG)) if RFLOG.exists() else 0
         print(f"sampler: {'running' if alive else 'stopped'}   samples logged: {lines}")
     elif sub == "analyze":
